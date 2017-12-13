@@ -1,0 +1,88 @@
+#! /usr/bin/env python3
+
+"""Run scheduled tasks for the ICLab clearinghouse.  Tasks are found
+in lib/tasks/ and are auto-enumerated.  Each task gets its own process
+and persistent home directory, but they all run under the same user ID.
+The scheduling quantum is five minutes.
+"""
+
+import os
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), "lib"))
+
+from apscheduler.schedulers.blocking import BlockingScheduler
+import argparse
+import setproctitle
+import signal
+import tasks
+
+class SignalWatcher:
+    def __init__(self, scheduler, logger):
+        self.scheduler = scheduler
+        self.logger = logger
+        self.interrupts = 0
+
+    def handler(self, *ignored):
+        if self.interrupts == 0:
+            self.interrupts += 1
+            self.logger.info("shutdown: waiting for running tasks to complete")
+
+            # False means "schedule the shutdown, but don't wait for
+            # any pending tasks to complete before returning", which
+            # is what we want.  We will wait for pending tasks in main.
+            self.scheduler.shutdown(False)
+
+        else:
+            self.logger.critical("shutdown: force immediate exit")
+            raise SystemExit(1)
+
+    def __enter__(self):
+        self.prev_signals = [
+            (sig, signal.signal(sig, self.handler))
+            for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)
+        ]
+
+    def __exit__(self, *ignored):
+        for sig, ph in self.prev_signals:
+            signal.signal(sig, ph)
+        return False
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    tasks.add_arguments(ap)
+    args = ap.parse_args()
+
+    # The worker processes must be started before the logging thread
+    # because it's not reliable for a multithreaded process to call fork().
+    # We also don't want them to hold the log file open.
+    # Inconveniently, we want FIFO teardown order for these objects so
+    # we can't just have them be context managers.
+    log_forwarder = tasks.LogForwarder(args)
+    executor = tasks.ProcessPoolWithStateDirs(args, log_forwarder)
+    try:
+        executor.prepare()
+        log_forwarder.start()
+        setproctitle.setproctitle(
+            os.path.basename(sys.argv[0]) + " scheduler")
+
+        scheduler = BlockingScheduler(
+            logger = log_forwarder.main_logger,
+            executors = { "pool": executor },
+            job_defaults = {
+                'misfire_grace_time': 5 * 60,
+                'coalesce': True,
+                'max_instances': 1
+            })
+
+        tasks.add_jobs(scheduler)
+
+        with SignalWatcher(scheduler, log_forwarder.main_logger):
+            scheduler.start()
+            # At this point, tasks may still be running.
+            executor.shutdown(wait=True)
+
+    finally:
+        executor.stop()
+        log_forwarder.stop()
+
+if __name__ == "__main__": main()
